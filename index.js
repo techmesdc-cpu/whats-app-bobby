@@ -5,6 +5,30 @@ const QRCode = require("qrcode");
 const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 
 const app = express();
+
+/* ======================
+   CORS FIX (MUST BE FIRST)
+====================== */
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, x-api-key"
+  );
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET, POST, OPTIONS"
+  );
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
+/* ======================
+   BODY PARSER
+====================== */
 app.use(express.json({ limit: "25mb" }));
 
 /* ======================
@@ -16,7 +40,10 @@ const API_KEY = "Techazux@123";
    API KEY VALIDATION
 ====================== */
 app.use((req, res, next) => {
-  const key = req.headers["x-api-key"] || req.body.api_key || req.query.api_key;
+  const key =
+    req.headers["x-api-key"] ||
+    req.body?.api_key ||
+    req.query?.api_key;
 
   if (key !== API_KEY) {
     return res.status(401).json({
@@ -36,9 +63,10 @@ const SESSION_PATH = "./sessions";
 
 /* ======================
    START CLIENT
+   (NO CUSTOM CHROMIUM)
 ====================== */
 function startClient(sender_id) {
-  if (clients[sender_id]) return clients[sender_id];
+  if (clients[sender_id]) return;
 
   const client = new Client({
     authStrategy: new LocalAuth({
@@ -46,8 +74,9 @@ function startClient(sender_id) {
       dataPath: SESSION_PATH,
     }),
     puppeteer: {
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      headless: true
+      // ❌ no executablePath
+      // ❌ no custom chromium flags
     },
   });
 
@@ -65,7 +94,6 @@ function startClient(sender_id) {
     console.log("DISCONNECTED:", sender_id, reason);
     delete clients[sender_id];
 
-    // AUTO RECONNECT
     setTimeout(() => {
       startClient(sender_id);
     }, 5000);
@@ -80,7 +108,9 @@ function startClient(sender_id) {
 ====================== */
 app.post("/device/init", (req, res) => {
   const { sender_id } = req.body;
-  if (!sender_id) return res.json({ status: false });
+  if (!sender_id) {
+    return res.json({ status: false, msg: "sender_id required" });
+  }
 
   startClient(sender_id);
   res.json({ status: true });
@@ -92,7 +122,10 @@ app.post("/device/init", (req, res) => {
 app.get("/device/qr/:sender_id", async (req, res) => {
   const qr = qrStore[req.params.sender_id];
   if (!qr) {
-    return res.json({ status: false, msg: "QR not available" });
+    return res.json({
+      status: false,
+      msg: "QR not available",
+    });
   }
 
   const qrImg = await QRCode.toDataURL(qr);
@@ -108,9 +141,8 @@ app.get("/device/status/:sender_id", (req, res) => {
 
   if (client.info) {
     return res.json({ status: "connected" });
-  } else {
-    return res.json({ status: "connecting" });
   }
+  return res.json({ status: "connecting" });
 });
 
 /* ======================
@@ -119,6 +151,7 @@ app.get("/device/status/:sender_id", (req, res) => {
 app.post("/device/logout", async (req, res) => {
   const { sender_id } = req.body;
   const client = clients[sender_id];
+
   if (!client) return res.json({ status: false });
 
   await client.logout();
@@ -128,7 +161,7 @@ app.post("/device/logout", async (req, res) => {
 });
 
 /* ======================
-   DELETE DEVICE (SESSION REMOVE)
+   DELETE DEVICE
 ====================== */
 app.post("/device/delete", async (req, res) => {
   const { sender_id } = req.body;
@@ -138,7 +171,10 @@ app.post("/device/delete", async (req, res) => {
     delete clients[sender_id];
   }
 
-  const sessionDir = path.join(SESSION_PATH, `session-${sender_id}`);
+  const sessionDir = path.join(
+    SESSION_PATH,
+    `session-${sender_id}`
+  );
   if (fs.existsSync(sessionDir)) {
     fs.rmSync(sessionDir, { recursive: true, force: true });
   }
@@ -147,46 +183,75 @@ app.post("/device/delete", async (req, res) => {
 });
 
 /* ======================
-   SEND TEXT MESSAGE
+   SEND TEXT
 ====================== */
 app.post("/send/text", async (req, res) => {
-  const { sender_id, phone, message } = req.body;
-  const client = clients[sender_id];
+  try {
+    const { sender_id, phone, message } = req.body;
+    const client = clients[sender_id];
 
-  if (!client) {
-    return res.json({ status: false, msg: "Device not connected" });
+    if (!client || !client.info) {
+      return res.json({
+        status: false,
+        msg: "Device not connected",
+      });
+    }
+
+    await client.sendMessage(`${phone}@c.us`, message);
+    res.json({ status: true });
+  } catch (e) {
+    res.json({ status: false, error: e.message });
   }
-
-  await client.sendMessage(`${phone}@c.us`, message);
-  res.json({ status: true });
 });
 
 /* ======================
    SEND MEDIA
 ====================== */
 app.post("/send/media", async (req, res) => {
-  const { sender_id, phone, base64, mimetype, filename, caption } = req.body;
-  const client = clients[sender_id];
+  try {
+    const {
+      sender_id,
+      phone,
+      base64,
+      mimetype,
+      filename,
+      caption,
+    } = req.body;
 
-  if (!client) {
-    return res.json({ status: false, msg: "Device not connected" });
+    const client = clients[sender_id];
+    if (!client || !client.info) {
+      return res.json({
+        status: false,
+        msg: "Device not connected",
+      });
+    }
+
+    const media = new MessageMedia(
+      mimetype,
+      base64,
+      filename
+    );
+    await client.sendMessage(
+      `${phone}@c.us`,
+      media,
+      { caption }
+    );
+
+    res.json({ status: true });
+  } catch (e) {
+    res.json({ status: false, error: e.message });
   }
-
-  const media = new MessageMedia(mimetype, base64, filename);
-  await client.sendMessage(`${phone}@c.us`, media, { caption });
-
-  res.json({ status: true });
 });
 
 /* ======================
-   AUTO START SAVED SESSIONS
+   AUTO START SESSIONS
 ====================== */
 if (!fs.existsSync(SESSION_PATH)) {
   fs.mkdirSync(SESSION_PATH);
 }
 
 fs.readdirSync(SESSION_PATH, { withFileTypes: true })
-  .filter((dir) => dir.isDirectory())
+  .filter((d) => d.isDirectory())
   .forEach((dir) => {
     const sender_id = dir.name.replace("session-", "");
     console.log("Auto starting:", sender_id);
@@ -198,5 +263,8 @@ fs.readdirSync(SESSION_PATH, { withFileTypes: true })
 ====================== */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log("WhatsApp Engine Running on port", PORT);
+  console.log(
+    "WhatsApp Engine Running on port",
+    PORT
+  );
 });
