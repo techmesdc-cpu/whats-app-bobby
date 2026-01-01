@@ -2,12 +2,18 @@ const express = require("express");
 const fs = require("fs");
 const path = require("path");
 const QRCode = require("qrcode");
-const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
+const pino = require("pino");
+
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason
+} = require("@whiskeysockets/baileys");
 
 const app = express();
 
 /* ======================
-   CORS FIX (MUST BE FIRST)
+   CORS (Browser Safe)
 ====================== */
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -19,26 +25,17 @@ app.use((req, res, next) => {
     "Access-Control-Allow-Methods",
     "GET, POST, OPTIONS"
   );
-
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(200);
-  }
+  if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
 
-/* ======================
-   BODY PARSER
-====================== */
 app.use(express.json({ limit: "25mb" }));
 
 /* ======================
-   FIXED API KEY
+   API KEY
 ====================== */
 const API_KEY = "Techazux@123";
 
-/* ======================
-   API KEY VALIDATION
-====================== */
 app.use((req, res, next) => {
   const key =
     req.headers["x-api-key"] ||
@@ -46,73 +43,77 @@ app.use((req, res, next) => {
     req.query?.api_key;
 
   if (key !== API_KEY) {
-    return res.status(401).json({
-      status: false,
-      msg: "Invalid API Key",
-    });
+    return res
+      .status(401)
+      .json({ status: false, msg: "Invalid API Key" });
   }
   next();
 });
 
 /* ======================
-   GLOBAL VARIABLES
+   GLOBAL STORES
 ====================== */
-const clients = {};
+const sockets = {};
 const qrStore = {};
 const SESSION_PATH = "./sessions";
 
 /* ======================
-   START CLIENT
-   (NO CUSTOM CHROMIUM)
+   START DEVICE
 ====================== */
-function startClient(sender_id) {
-  if (clients[sender_id]) return;
+async function startDevice(sender_id) {
+  if (sockets[sender_id]) return;
 
-  const client = new Client({
-    authStrategy: new LocalAuth({
-      clientId: sender_id,
-      dataPath: SESSION_PATH,
-    }),
-    puppeteer: {
-      headless: true
-      // ❌ no executablePath
-      // ❌ no custom chromium flags
-    },
+  const authPath = path.join(SESSION_PATH, sender_id);
+  const { state, saveCreds } =
+    await useMultiFileAuthState(authPath);
+
+  const sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: false,
+    logger: pino({ level: "silent" })
   });
 
-  client.on("qr", (qr) => {
-    qrStore[sender_id] = qr;
-    console.log("QR Generated:", sender_id);
+  sockets[sender_id] = sock;
+
+  sock.ev.on("creds.update", saveCreds);
+
+  sock.ev.on("connection.update", async (update) => {
+    const { connection, qr, lastDisconnect } = update;
+
+    if (qr) {
+      qrStore[sender_id] = qr;
+      console.log("QR Generated:", sender_id);
+    }
+
+    if (connection === "open") {
+      console.log("CONNECTED:", sender_id);
+      delete qrStore[sender_id];
+    }
+
+    if (connection === "close") {
+      const reason =
+        lastDisconnect?.error?.output?.statusCode;
+
+      console.log("DISCONNECTED:", sender_id, reason);
+
+      delete sockets[sender_id];
+
+      if (reason !== DisconnectReason.loggedOut) {
+        setTimeout(() => startDevice(sender_id), 3000);
+      }
+    }
   });
-
-  client.on("ready", () => {
-    console.log("READY:", sender_id);
-    delete qrStore[sender_id];
-  });
-
-  client.on("disconnected", (reason) => {
-    console.log("DISCONNECTED:", sender_id, reason);
-    delete clients[sender_id];
-
-    setTimeout(() => {
-      startClient(sender_id);
-    }, 5000);
-  });
-
-  client.initialize();
-  clients[sender_id] = client;
 }
 
 /* ======================
    DEVICE INIT
 ====================== */
-app.post("/device/init", (req, res) => {
+app.post("/device/init", async (req, res) => {
   const { sender_id } = req.body;
-  if (!sender_id) {
+  if (!sender_id)
     return res.json({ status: false, msg: "sender_id required" });
-  }
 
-  startClient(sender_id);
+  await startDevice(sender_id);
   res.json({ status: true });
 });
 
@@ -121,28 +122,20 @@ app.post("/device/init", (req, res) => {
 ====================== */
 app.get("/device/qr/:sender_id", async (req, res) => {
   const qr = qrStore[req.params.sender_id];
-  if (!qr) {
-    return res.json({
-      status: false,
-      msg: "QR not available",
-    });
-  }
+  if (!qr)
+    return res.json({ status: false, msg: "QR not available" });
 
-  const qrImg = await QRCode.toDataURL(qr);
-  res.json({ status: true, qr: qrImg });
+  const img = await QRCode.toDataURL(qr);
+  res.json({ status: true, qr: img });
 });
 
 /* ======================
    DEVICE STATUS
 ====================== */
 app.get("/device/status/:sender_id", (req, res) => {
-  const client = clients[req.params.sender_id];
-  if (!client) return res.json({ status: "offline" });
-
-  if (client.info) {
-    return res.json({ status: "connected" });
-  }
-  return res.json({ status: "connecting" });
+  const sock = sockets[req.params.sender_id];
+  if (!sock) return res.json({ status: "offline" });
+  return res.json({ status: "connected" });
 });
 
 /* ======================
@@ -150,34 +143,11 @@ app.get("/device/status/:sender_id", (req, res) => {
 ====================== */
 app.post("/device/logout", async (req, res) => {
   const { sender_id } = req.body;
-  const client = clients[sender_id];
+  const sock = sockets[sender_id];
+  if (!sock) return res.json({ status: false });
 
-  if (!client) return res.json({ status: false });
-
-  await client.logout();
-  delete clients[sender_id];
-
-  res.json({ status: true });
-});
-
-/* ======================
-   DELETE DEVICE
-====================== */
-app.post("/device/delete", async (req, res) => {
-  const { sender_id } = req.body;
-
-  if (clients[sender_id]) {
-    await clients[sender_id].destroy();
-    delete clients[sender_id];
-  }
-
-  const sessionDir = path.join(
-    SESSION_PATH,
-    `session-${sender_id}`
-  );
-  if (fs.existsSync(sessionDir)) {
-    fs.rmSync(sessionDir, { recursive: true, force: true });
-  }
+  await sock.logout();
+  delete sockets[sender_id];
 
   res.json({ status: true });
 });
@@ -188,16 +158,19 @@ app.post("/device/delete", async (req, res) => {
 app.post("/send/text", async (req, res) => {
   try {
     const { sender_id, phone, message } = req.body;
-    const client = clients[sender_id];
+    const sock = sockets[sender_id];
 
-    if (!client || !client.info) {
+    if (!sock)
       return res.json({
         status: false,
-        msg: "Device not connected",
+        msg: "Device not connected"
       });
-    }
 
-    await client.sendMessage(`${phone}@c.us`, message);
+    await sock.sendMessage(
+      `${phone}@s.whatsapp.net`,
+      { text: message }
+    );
+
     res.json({ status: true });
   } catch (e) {
     res.json({ status: false, error: e.message });
@@ -205,7 +178,7 @@ app.post("/send/text", async (req, res) => {
 });
 
 /* ======================
-   SEND MEDIA
+   SEND MEDIA (BASE64)
 ====================== */
 app.post("/send/media", async (req, res) => {
   try {
@@ -214,27 +187,25 @@ app.post("/send/media", async (req, res) => {
       phone,
       base64,
       mimetype,
-      filename,
-      caption,
+      caption
     } = req.body;
 
-    const client = clients[sender_id];
-    if (!client || !client.info) {
+    const sock = sockets[sender_id];
+    if (!sock)
       return res.json({
         status: false,
-        msg: "Device not connected",
+        msg: "Device not connected"
       });
-    }
 
-    const media = new MessageMedia(
-      mimetype,
-      base64,
-      filename
-    );
-    await client.sendMessage(
-      `${phone}@c.us`,
-      media,
-      { caption }
+    const buffer = Buffer.from(base64, "base64");
+
+    await sock.sendMessage(
+      `${phone}@s.whatsapp.net`,
+      {
+        image: buffer,
+        mimetype,
+        caption
+      }
     );
 
     res.json({ status: true });
@@ -250,21 +221,15 @@ if (!fs.existsSync(SESSION_PATH)) {
   fs.mkdirSync(SESSION_PATH);
 }
 
-fs.readdirSync(SESSION_PATH, { withFileTypes: true })
-  .filter((d) => d.isDirectory())
-  .forEach((dir) => {
-    const sender_id = dir.name.replace("session-", "");
-    console.log("Auto starting:", sender_id);
-    startClient(sender_id);
-  });
+fs.readdirSync(SESSION_PATH).forEach((id) => {
+  console.log("Auto starting:", id);
+  startDevice(id);
+});
 
 /* ======================
    SERVER START
 ====================== */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(
-    "WhatsApp Engine Running on port",
-    PORT
-  );
+  console.log("Baileys WhatsApp Engine running on", PORT);
 });
