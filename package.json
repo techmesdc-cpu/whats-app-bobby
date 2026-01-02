@@ -1,15 +1,13 @@
 {
-  "name": "baileys-engine",
+  "name": "baileys-railway",
   "version": "1.0.0",
+  "type": "module",
   "main": "index.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.9",
-    "express": "^4.19.2",
-    "qrcode": "^1.5.4",
-    "pino": "^8.17.0"
+    "@whiskeysockets/baileys": "^6.7.8",
+    "express": "^4.19.2"
   }
 }
