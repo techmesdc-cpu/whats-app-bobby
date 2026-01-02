@@ -1,235 +1,128 @@
-const express = require("express");
-const fs = require("fs");
-const path = require("path");
-const QRCode = require("qrcode");
-const pino = require("pino");
-
-const {
-  default: makeWASocket,
+import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason
-} = require("@whiskeysockets/baileys");
+} from "@whiskeysockets/baileys";
+
+import express from "express";
+import P from "pino";
 
 const app = express();
+app.use(express.json());
 
-/* ======================
-   CORS (Browser Safe)
-====================== */
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, x-api-key"
-  );
-  res.setHeader(
-    "Access-Control-Allow-Methods",
-    "GET, POST, OPTIONS"
-  );
-  if (req.method === "OPTIONS") return res.sendStatus(200);
-  next();
-});
+let sock;
+let isConnected = false;
 
-app.use(express.json({ limit: "25mb" }));
+/* =========================
+   INIT WHATSAPP SOCKET
+========================= */
+async function startWhatsApp() {
+  const { state, saveCreds } = await useMultiFileAuthState("./sessions");
 
-/* ======================
-   API KEY
-====================== */
-const API_KEY = "Techazux@123";
-
-app.use((req, res, next) => {
-  const key =
-    req.headers["x-api-key"] ||
-    req.body?.api_key ||
-    req.query?.api_key;
-
-  if (key !== API_KEY) {
-    return res
-      .status(401)
-      .json({ status: false, msg: "Invalid API Key" });
-  }
-  next();
-});
-
-/* ======================
-   GLOBAL STORES
-====================== */
-const sockets = {};
-const qrStore = {};
-const SESSION_PATH = "./sessions";
-
-/* ======================
-   START DEVICE
-====================== */
-async function startDevice(sender_id) {
-  if (sockets[sender_id]) return;
-
-  const authPath = path.join(SESSION_PATH, sender_id);
-  const { state, saveCreds } =
-    await useMultiFileAuthState(authPath);
-
-  const sock = makeWASocket({
+  sock = makeWASocket({
     auth: state,
-    printQRInTerminal: false,
-    logger: pino({ level: "silent" })
-  });
+    logger: P({ level: "silent" }),
 
-  sockets[sender_id] = sock;
+    // ---- LOW RAM OPTIMIZATION ----
+    printQRInTerminal: true,
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+    generateHighQualityLinkPreview: false
+  });
 
   sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, qr, lastDisconnect } = update;
+  sock.ev.on("connection.update", (update) => {
+    const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      qrStore[sender_id] = qr;
-      console.log("QR Generated:", sender_id);
+      console.log("🔑 Scan QR above");
     }
 
     if (connection === "open") {
-      console.log("CONNECTED:", sender_id);
-      delete qrStore[sender_id];
+      isConnected = true;
+      console.log("✅ WhatsApp Connected");
     }
 
     if (connection === "close") {
-      const reason =
-        lastDisconnect?.error?.output?.statusCode;
+      isConnected = false;
+      const reason = lastDisconnect?.error?.output?.statusCode;
 
-      console.log("DISCONNECTED:", sender_id, reason);
-
-      delete sockets[sender_id];
+      console.log("❌ Disconnected. Reason:", reason);
 
       if (reason !== DisconnectReason.loggedOut) {
-        setTimeout(() => startDevice(sender_id), 3000);
+        console.log("🔁 Reconnecting...");
+        startWhatsApp();
+      } else {
+        console.log("🚫 Logged out. Delete session folder & rescan.");
       }
     }
   });
 }
 
-/* ======================
-   DEVICE INIT
-====================== */
-app.post("/device/init", async (req, res) => {
-  const { sender_id } = req.body;
-  if (!sender_id)
-    return res.json({ status: false, msg: "sender_id required" });
+startWhatsApp();
 
-  await startDevice(sender_id);
-  res.json({ status: true });
-});
+/* =========================
+   API ROUTES
+========================= */
 
-/* ======================
-   GET QR
-====================== */
-app.get("/device/qr/:sender_id", async (req, res) => {
-  const qr = qrStore[req.params.sender_id];
-  if (!qr)
-    return res.json({ status: false, msg: "QR not available" });
-
-  const img = await QRCode.toDataURL(qr);
-  res.json({ status: true, qr: img });
-});
-
-/* ======================
-   DEVICE STATUS
-====================== */
-app.get("/device/status/:sender_id", (req, res) => {
-  const sock = sockets[req.params.sender_id];
-  if (!sock) return res.json({ status: "offline" });
-  return res.json({ status: "connected" });
-});
-
-/* ======================
-   LOGOUT DEVICE
-====================== */
-app.post("/device/logout", async (req, res) => {
-  const { sender_id } = req.body;
-  const sock = sockets[sender_id];
-  if (!sock) return res.json({ status: false });
-
-  await sock.logout();
-  delete sockets[sender_id];
-
-  res.json({ status: true });
-});
-
-/* ======================
-   SEND TEXT
-====================== */
-app.post("/send/text", async (req, res) => {
+/**
+ * POST /send
+ * Body:
+ * {
+ *   "number": "919XXXXXXXXX",
+ *   "message": "Hello from Railway"
+ * }
+ */
+app.post("/send", async (req, res) => {
   try {
-    const { sender_id, phone, message } = req.body;
-    const sock = sockets[sender_id];
-
-    if (!sock)
-      return res.json({
-        status: false,
-        msg: "Device not connected"
+    if (!isConnected) {
+      return res.status(503).json({
+        success: false,
+        message: "WhatsApp not connected"
       });
+    }
 
-    await sock.sendMessage(
-      `${phone}@s.whatsapp.net`,
-      { text: message }
-    );
+    const { number, message } = req.body;
 
-    res.json({ status: true });
-  } catch (e) {
-    res.json({ status: false, error: e.message });
+    if (!number || !message) {
+      return res.status(400).json({
+        success: false,
+        message: "number & message required"
+      });
+    }
+
+    const jid = number.replace(/\D/g, "") + "@s.whatsapp.net";
+
+    await sock.sendMessage(jid, { text: message });
+
+    res.json({
+      success: true,
+      message: "Message sent"
+    });
+
+  } catch (err) {
+    console.error("SEND ERROR:", err);
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
   }
 });
 
-/* ======================
-   SEND MEDIA (BASE64)
-====================== */
-app.post("/send/media", async (req, res) => {
-  try {
-    const {
-      sender_id,
-      phone,
-      base64,
-      mimetype,
-      caption
-    } = req.body;
-
-    const sock = sockets[sender_id];
-    if (!sock)
-      return res.json({
-        status: false,
-        msg: "Device not connected"
-      });
-
-    const buffer = Buffer.from(base64, "base64");
-
-    await sock.sendMessage(
-      `${phone}@s.whatsapp.net`,
-      {
-        image: buffer,
-        mimetype,
-        caption
-      }
-    );
-
-    res.json({ status: true });
-  } catch (e) {
-    res.json({ status: false, error: e.message });
-  }
+/* =========================
+   HEALTH CHECK
+========================= */
+app.get("/", (req, res) => {
+  res.json({
+    status: "running",
+    whatsapp: isConnected ? "connected" : "disconnected"
+  });
 });
 
-/* ======================
-   AUTO START SESSIONS
-====================== */
-if (!fs.existsSync(SESSION_PATH)) {
-  fs.mkdirSync(SESSION_PATH);
-}
-
-fs.readdirSync(SESSION_PATH).forEach((id) => {
-  console.log("Auto starting:", id);
-  startDevice(id);
-});
-
-/* ======================
-   SERVER START
-====================== */
+/* =========================
+   START SERVER
+========================= */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log("Baileys WhatsApp Engine running on", PORT);
+  console.log("🚀 API running on port", PORT);
 });
