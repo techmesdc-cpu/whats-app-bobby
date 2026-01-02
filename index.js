@@ -11,9 +11,10 @@ app.use(express.json());
 
 let sock;
 let isConnected = false;
+let latestQR = null;
 
 /* =========================
-   INIT WHATSAPP SOCKET
+   INIT WHATSAPP
 ========================= */
 async function startWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState("./sessions");
@@ -22,8 +23,7 @@ async function startWhatsApp() {
     auth: state,
     logger: P({ level: "silent" }),
 
-    // ---- LOW RAM OPTIMIZATION ----
-    printQRInTerminal: true,
+    // ---- RAILWAY / LOW RAM SAFE ----
     syncFullHistory: false,
     markOnlineOnConnect: false,
     generateHighQualityLinkPreview: false
@@ -34,12 +34,15 @@ async function startWhatsApp() {
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
 
+    // ---- QR HANDLING (API BASED) ----
     if (qr) {
-      console.log("🔑 Scan QR above");
+      latestQR = qr;
+      console.log("🔑 New QR generated (fetch via /qr)");
     }
 
     if (connection === "open") {
       isConnected = true;
+      latestQR = null;
       console.log("✅ WhatsApp Connected");
     }
 
@@ -53,7 +56,7 @@ async function startWhatsApp() {
         console.log("🔁 Reconnecting...");
         startWhatsApp();
       } else {
-        console.log("🚫 Logged out. Delete session folder & rescan.");
+        console.log("🚫 Logged out. Delete sessions folder to re-scan.");
       }
     }
   });
@@ -62,17 +65,25 @@ async function startWhatsApp() {
 startWhatsApp();
 
 /* =========================
-   API ROUTES
+   QR API (NO TERMINAL)
 ========================= */
+app.get("/qr", (req, res) => {
+  if (!latestQR) {
+    return res.json({
+      success: false,
+      message: "QR not available or already scanned"
+    });
+  }
 
-/**
- * POST /send
- * Body:
- * {
- *   "number": "919XXXXXXXXX",
- *   "message": "Hello from Railway"
- * }
- */
+  res.json({
+    success: true,
+    qr: latestQR
+  });
+});
+
+/* =========================
+   SEND MESSAGE API
+========================= */
 app.post("/send", async (req, res) => {
   try {
     if (!isConnected) {
@@ -110,7 +121,7 @@ app.post("/send", async (req, res) => {
 });
 
 /* =========================
-   HEALTH CHECK
+   STATUS / HEALTH CHECK
 ========================= */
 app.get("/", (req, res) => {
   res.json({
