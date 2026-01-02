@@ -1,207 +1,118 @@
-import makeWASocket, {
-  useMultiFileAuthState,
-  DisconnectReason
-} from "@whiskeysockets/baileys";
-
-import express from "express";
-import P from "pino";
-import QRCode from "qrcode";
-import fs from "fs";
+const { Client, LocalAuth } = require("whatsapp-web.js");
+const express = require("express");
+const QRCode = require("qrcode");
+const fs = require("fs");
 
 const app = express();
 app.use(express.json());
 
-let sock = null;
-let isConnected = false;
+let client;
 let latestQR = null;
-let isStarting = false;   // 🔒 prevents reconnect loop
+let ready = false;
 
 /* =========================
-   START WHATSAPP (SAFE)
+   INIT WHATSAPP (MINIMAL)
 ========================= */
-async function startWhatsApp() {
-  if (isStarting) {
-    console.log("⏸️ WhatsApp already starting, skipping...");
-    return;
-  }
-
-  isStarting = true;
-  console.log("🚀 Starting WhatsApp socket...");
-
-  const { state, saveCreds } = await useMultiFileAuthState("./sessions");
-
-  sock = makeWASocket({
-    auth: state,
-    logger: P({ level: "silent" }),
-
-    // ---- LOW RAM / RAILWAY SAFE ----
-    syncFullHistory: false,
-    markOnlineOnConnect: false,
-    generateHighQualityLinkPreview: false
-  });
-
-  sock.ev.on("creds.update", saveCreds);
-
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    // ---- QR HANDLING ----
-    if (qr) {
-      latestQR = qr;
-      console.log("🔑 QR generated (open /qr-image)");
-    }
-
-    // ---- CONNECTED ----
-    if (connection === "open") {
-      isConnected = true;
-      latestQR = null;
-      isStarting = false;
-      console.log("✅ WhatsApp Connected");
-    }
-
-    // ---- DISCONNECTED ----
-    if (connection === "close") {
-      isConnected = false;
-      latestQR = null;
-      isStarting = false;
-
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      console.log("❌ Disconnected. Reason:", statusCode);
-
-      // 🚫 DO NOT RECONNECT ON 405
-      if (statusCode === 405) {
-        console.log("🚫 405 BLOCKED");
-        console.log("👉 Action: call /reset → restart → scan new QR");
-        return;
-      }
-
-      // 🚫 LOGGED OUT
-      if (statusCode === DisconnectReason.loggedOut) {
-        console.log("🚫 Logged out. Session invalid.");
-        console.log("👉 Delete session & scan again.");
-        return;
-      }
-
-      // ✅ SAFE RECONNECT WITH DELAY
-      console.log("⏳ Reconnecting after 10 seconds...");
-      setTimeout(() => {
-        startWhatsApp();
-      }, 10000);
+function startWhatsApp() {
+  client = new Client({
+    authStrategy: new LocalAuth({ dataPath: "./session" }),
+    puppeteer: {
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--single-process"
+      ],
+      executablePath: process.env.CHROME_PATH || undefined
     }
   });
+
+  client.on("qr", (qr) => {
+    latestQR = qr;
+    console.log("🔑 QR generated");
+  });
+
+  client.on("ready", () => {
+    ready = true;
+    latestQR = null;
+    console.log("✅ WhatsApp Ready");
+  });
+
+  client.on("disconnected", (reason) => {
+    ready = false;
+    console.log("❌ Disconnected:", reason);
+  });
+
+  client.initialize();
 }
 
-// 🔥 INITIAL START
 startWhatsApp();
 
 /* =========================
-   STATUS CHECK
+   STATUS
 ========================= */
 app.get("/", (req, res) => {
   res.json({
-    status: "running",
-    whatsapp: isConnected ? "connected" : "disconnected"
+    whatsapp: ready ? "connected" : "disconnected"
   });
 });
 
 /* =========================
-   QR IMAGE (BEST METHOD)
+   QR IMAGE API
 ========================= */
-app.get("/qr-image", async (req, res) => {
-  if (isConnected) {
-    return res.send("WhatsApp already connected");
-  }
+app.get("/qr", async (req, res) => {
+  if (ready) return res.send("Already connected");
+  if (!latestQR) return res.send("QR not ready, refresh");
 
-  if (!latestQR) {
-    return res.send("QR not ready. Refresh after 5–10 seconds.");
-  }
-
-  try {
-    const dataUrl = await QRCode.toDataURL(latestQR);
-    const img = Buffer.from(dataUrl.split(",")[1], "base64");
-
-    res.writeHead(200, {
-      "Content-Type": "image/png",
-      "Content-Length": img.length
-    });
-    res.end(img);
-  } catch (err) {
-    res.status(500).send("QR generation failed");
-  }
+  const img = await QRCode.toBuffer(latestQR);
+  res.type("png").send(img);
 });
 
 /* =========================
-   SEND MESSAGE API
+   SEND MESSAGE
 ========================= */
 app.post("/send", async (req, res) => {
+  if (!ready) {
+    return res.status(503).json({ success: false });
+  }
+
+  const { number, message } = req.body;
+  if (!number || !message) {
+    return res.status(400).json({ success: false });
+  }
+
   try {
-    if (!isConnected) {
-      return res.status(503).json({
-        success: false,
-        message: "WhatsApp not connected"
-      });
-    }
-
-    const { number, message } = req.body;
-
-    if (!number || !message) {
-      return res.status(400).json({
-        success: false,
-        message: "number & message required"
-      });
-    }
-
-    const jid = number.replace(/\D/g, "") + "@s.whatsapp.net";
-    await sock.sendMessage(jid, { text: message });
-
-    res.json({
-      success: true,
-      message: "Message sent"
-    });
-  } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
+    await client.sendMessage(number + "@c.us", message);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
   }
 });
 
 /* =========================
-   FORCE RESET (SAFE)
+   LOGOUT + DELETE SESSION
 ========================= */
-app.get("/reset", async (req, res) => {
+app.get("/logout", async (req, res) => {
   try {
-    console.log("♻️ Resetting WhatsApp session...");
+    await client.logout();
+    ready = false;
 
-    if (sock) {
-      await sock.logout();
-      sock = null;
+    if (fs.existsSync("./session")) {
+      fs.rmSync("./session", { recursive: true, force: true });
     }
 
-    isConnected = false;
-    latestQR = null;
-    isStarting = false;
-
-    if (fs.existsSync("./sessions")) {
-      fs.rmSync("./sessions", { recursive: true, force: true });
-    }
-
-    res.json({
-      success: true,
-      message: "Session reset. Restart service & scan new QR."
-    });
-  } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
+    res.json({ success: true, message: "Logged out" });
+  } catch (e) {
+    res.status(500).json({ success: false });
   }
 });
 
 /* =========================
-   START HTTP SERVER
+   START SERVER
 ========================= */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log("🌐 API running on port", PORT);
+  console.log("🚀 Server running on", PORT);
 });
