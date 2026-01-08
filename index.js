@@ -1,170 +1,137 @@
-import makeWASocket, {
-  useMultiFileAuthState,
-  DisconnectReason
-} from "@whiskeysockets/baileys";
-
-import express from "express";
-import P from "pino";
-import QRCode from "qrcode";
-import fs from "fs";
+const { Client, LocalAuth } = require('whatsapp-web.js');
+const express = require('express');
+const QRCode = require('qrcode');
+const cors = require('cors');
+const fs = require('fs-extra');
 
 const app = express();
 app.use(express.json());
+app.use(cors());
 
-let sock = null;
-let isConnected = false;
-let latestQR = null;
+const PORT = 3000;
 
-/* =========================
-   START WHATSAPP (NO LOOP)
-========================= */
-async function startWhatsApp() {
-  console.log("🚀 Starting WhatsApp (Baileys, safe mode)");
+/* ==========================
+   SESSION STORE
+========================== */
+const clients = {};
+const qrStore = {};
 
-  const { state, saveCreds } = await useMultiFileAuthState("./session");
+/* ==========================
+   INIT CLIENT
+========================== */
+function initClient(sessionId) {
 
-  sock = makeWASocket({
-    auth: state,
-    logger: P({ level: "silent" }),
+    if (clients[sessionId]) return;
 
-    // 🔒 STRICT SAFE OPTIONS
-    syncFullHistory: false,
-    markOnlineOnConnect: false,
-    generateHighQualityLinkPreview: false
-  });
+    const client = new Client({
+        authStrategy: new LocalAuth({ clientId: sessionId }),
+        puppeteer: {
+            headless: true,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox'
+            ]
+        }
+    });
 
-  sock.ev.on("creds.update", saveCreds);
+    client.on('qr', async (qr) => {
+        qrStore[sessionId] = await QRCode.toDataURL(qr);
+        console.log(`QR Generated: ${sessionId}`);
+    });
 
-  sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect, qr } = update;
+    client.on('ready', () => {
+        qrStore[sessionId] = null;
+        console.log(`Client Ready: ${sessionId}`);
+    });
 
-    if (qr) {
-      latestQR = qr;
-      console.log("🔑 QR generated (open /qr)");
-    }
+    client.on('authenticated', () => {
+        console.log(`Authenticated: ${sessionId}`);
+    });
 
-    if (connection === "open") {
-      isConnected = true;
-      latestQR = null;
-      console.log("✅ WhatsApp connected");
-    }
+    client.on('disconnected', (reason) => {
+        console.log(`Disconnected ${sessionId}: ${reason}`);
+        client.destroy();
+        delete clients[sessionId];
+        setTimeout(() => initClient(sessionId), 5000); // auto reconnect
+    });
 
-    if (connection === "close") {
-      isConnected = false;
-      latestQR = null;
-
-      const code = lastDisconnect?.error?.output?.statusCode;
-      console.log("❌ Disconnected. Reason:", code);
-
-      console.log("🛑 Auto reconnect DISABLED");
-      console.log("👉 Fix: /reset → restart → scan QR again");
-    }
-  });
+    client.initialize();
+    clients[sessionId] = client;
 }
 
-startWhatsApp();
+/* ==========================
+   CREATE / LOAD SESSION
+========================== */
+app.post('/session/create', (req, res) => {
+    const { sessionId } = req.body;
+    if (!sessionId) return res.json({ status: false, message: 'sessionId required' });
 
-/* =========================
-   STATUS
-========================= */
-app.get("/", (req, res) => {
-  res.json({
-    status: "running",
-    whatsapp: isConnected ? "connected" : "disconnected"
-  });
+    initClient(sessionId);
+    res.json({ status: true, message: 'Session started' });
 });
 
-/* =========================
-   QR IMAGE (MANUAL)
-========================= */
-app.get("/qr", async (req, res) => {
-  if (isConnected) {
-    return res.send("WhatsApp already connected");
-  }
+/* ==========================
+   GET QR CODE
+========================== */
+app.get('/session/qr/:sessionId', (req, res) => {
+    const { sessionId } = req.params;
 
-  if (!latestQR) {
-    return res.send("QR not ready. Wait 5–10 seconds.");
-  }
-
-  try {
-    const img = await QRCode.toBuffer(latestQR);
-    res.type("png").send(img);
-  } catch {
-    res.status(500).send("QR error");
-  }
-});
-
-/* =========================
-   SEND TEXT MESSAGE
-========================= */
-app.post("/send", async (req, res) => {
-  if (!isConnected) {
-    return res.status(503).json({
-      success: false,
-      message: "WhatsApp not connected"
-    });
-  }
-
-  const { number, message } = req.body;
-
-  if (!number || !message) {
-    return res.status(400).json({
-      success: false,
-      message: "number & message required"
-    });
-  }
-
-  try {
-    const jid = number.replace(/\D/g, "") + "@s.whatsapp.net";
-    await sock.sendMessage(jid, { text: message });
-
-    res.json({
-      success: true,
-      message: "Message sent"
-    });
-  } catch (e) {
-    res.status(500).json({
-      success: false,
-      error: e.message
-    });
-  }
-});
-
-/* =========================
-   LOGOUT + DELETE SESSION
-========================= */
-app.get("/reset", async (req, res) => {
-  try {
-    console.log("♻️ Resetting session");
-
-    if (sock) {
-      await sock.logout();
-      sock = null;
+    if (!qrStore[sessionId]) {
+        return res.json({ status: false, message: 'QR not available / already scanned' });
     }
 
-    isConnected = false;
-    latestQR = null;
-
-    if (fs.existsSync("./session")) {
-      fs.rmSync("./session", { recursive: true, force: true });
-    }
-
-    res.json({
-      success: true,
-      message: "Session cleared. Restart app & scan new QR."
-    });
-  } catch (e) {
-    res.status(500).json({
-      success: false,
-      error: e.message
-    });
-  }
+    res.json({ status: true, qr: qrStore[sessionId] });
 });
 
-/* =========================
-   START SERVER
-========================= */
-const PORT = process.env.PORT || 3000;
+/* ==========================
+   SEND MESSAGE
+========================== */
+app.post('/send-message', async (req, res) => {
+    const { sessionId, number, message } = req.body;
+
+    if (!clients[sessionId])
+        return res.json({ status: false, message: 'Invalid session' });
+
+    try {
+        const chatId = number.includes('@c.us')
+            ? number
+            : number + '@c.us';
+
+        await clients[sessionId].sendMessage(chatId, message);
+        res.json({ status: true, message: 'Message sent' });
+
+    } catch (err) {
+        res.json({ status: false, error: err.message });
+    }
+});
+
+/* ==========================
+   LOGOUT SESSION
+========================== */
+app.post('/session/logout', async (req, res) => {
+    const { sessionId } = req.body;
+
+    if (!clients[sessionId])
+        return res.json({ status: false, message: 'Session not found' });
+
+    await clients[sessionId].logout();
+    clients[sessionId].destroy();
+    delete clients[sessionId];
+
+    fs.removeSync(`.wwebjs_auth/session-${sessionId}`);
+    res.json({ status: true, message: 'Logged out & device removed' });
+});
+
+/* ==========================
+   LIST SESSIONS
+========================== */
+app.get('/sessions', (req, res) => {
+    res.json({ active_sessions: Object.keys(clients) });
+});
+
+/* ==========================
+   SERVER START
+========================== */
 app.listen(PORT, () => {
-  console.log("🌐 API running on port", PORT);
+    console.log(`WhatsApp API running on port ${PORT}`);
 });
